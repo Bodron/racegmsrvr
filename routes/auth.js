@@ -1,6 +1,7 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
+const crypto = require('crypto');
 const User = require('../models/User');
 const authMiddleware = require('../middleware/auth');
 const uploadToS3 = require('../utils/awsUpload');
@@ -69,6 +70,30 @@ function progressionFromUser(user) {
 const generateToken = (userId) => {
   return jwt.sign({ userId }, JWT_SECRET, { expiresIn: '7d' });
 };
+
+let _jose = null;
+let _appleJwks = null;
+async function verifyAppleIdToken(idToken) {
+  if (!_jose) _jose = await import('jose');
+
+  const { jwtVerify, createRemoteJWKSet } = _jose;
+  if (!_appleJwks) {
+    _appleJwks = createRemoteJWKSet(
+      new URL('https://appleid.apple.com/auth/keys'),
+    );
+  }
+
+  const audiences = [
+    process.env.APPLE_CLIENT_ID,
+    process.env.IOS_BUNDLE_ID,
+    'com.racegm.ro',
+  ].filter(Boolean);
+
+  return jwtVerify(idToken, _appleJwks, {
+    issuer: 'https://appleid.apple.com',
+    audience: audiences,
+  });
+}
 
 // Register new user
 router.post('/register', [
@@ -245,6 +270,107 @@ router.post('/login', [
     console.error(`⏱️  Failed after ${duration}ms`);
     console.log('=== LOGIN FAILED ===\n');
     res.status(500).json({ message: 'Server error during login', error: error.message });
+  }
+});
+
+// Native Sign in with Apple (mobile)
+router.post('/apple/mobile', async (req, res) => {
+  const startTime = Date.now();
+  const clientIp = req.ip || req.connection.remoteAddress;
+
+  try {
+    console.log('\n=== APPLE SIGN IN (MOBILE) ===');
+    console.log(`[${new Date().toISOString()}] IP: ${clientIp}`);
+
+    const idToken = req.body?.idToken?.toString();
+    if (!idToken) {
+      return res.status(400).json({ message: 'Missing idToken' });
+    }
+
+    const { payload } = await verifyAppleIdToken(idToken);
+    const appleSub = payload?.sub?.toString();
+
+    if (!appleSub) {
+      return res.status(401).json({ message: 'Invalid Apple token (missing sub)' });
+    }
+
+    const tokenEmail = payload?.email?.toString()?.toLowerCase();
+    const bodyEmail = req.body?.email?.toString()?.toLowerCase();
+    const email = tokenEmail || bodyEmail || null;
+
+    const givenName = req.body?.givenName?.toString();
+    const familyName = req.body?.familyName?.toString();
+    const nameFromBody = req.body?.name?.toString();
+    const name = nameFromBody ||
+        [givenName, familyName].filter(Boolean).join(' ').trim() ||
+        payload?.name?.toString() ||
+        '';
+
+    const queryOr = [{ appleId: appleSub }];
+    if (email) queryOr.push({ email });
+
+    let user = await User.findOne({ $or: queryOr });
+    if (!user) {
+      const safeEmail = email || `${appleSub}@appleid.local`;
+      const nicknameSeed =
+          safeEmail.split('@')[0] || name || `runner${appleSub.slice(-4)}`;
+      const nickname = await generateUniqueNickname(nicknameSeed);
+
+      // Keep password required; generate a strong random one for Apple users.
+      const randomPassword = crypto.randomBytes(32).toString('base64url');
+
+      user = new User({
+        appleId: appleSub,
+        email: safeEmail,
+        password: randomPassword,
+        name,
+        nickname,
+      });
+      await user.save();
+    } else {
+      let shouldSave = false;
+      if (!user.appleId) {
+        user.appleId = appleSub;
+        shouldSave = true;
+      }
+      if ((!user.email || user.email.endsWith('@appleid.local')) && email) {
+        user.email = email;
+        shouldSave = true;
+      }
+      if (!user.nickname) {
+        user.nickname = await generateUniqueNickname(email?.split('@')[0] || name);
+        shouldSave = true;
+      }
+      if (name && !user.name) {
+        user.name = name;
+        shouldSave = true;
+      }
+      if (shouldSave) await user.save();
+    }
+
+    const token = generateToken(user._id);
+    const duration = Date.now() - startTime;
+    console.log(`✅ Apple sign in OK in ${duration}ms (user: ${user._id})`);
+
+    res.json({
+      message: 'Login successful',
+      token,
+      user: {
+        id: user._id,
+        email: user.email,
+        name: user.name,
+        nickname: user.nickname,
+        avatarUrl: user.avatarUrl,
+      },
+    });
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    console.error('❌ Apple sign in error:', error);
+    console.error(`⏱️  Failed after ${duration}ms`);
+    res.status(500).json({
+      message: 'Server error during Apple sign in',
+      error: error.message,
+    });
   }
 });
 

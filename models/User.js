@@ -2,6 +2,13 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 
 const userSchema = new mongoose.Schema({
+  appleId: {
+    type: String,
+    unique: true,
+    sparse: true,
+    index: true,
+    trim: true,
+  },
   email: {
     type: String,
     required: [true, 'Email is required'],
@@ -32,6 +39,9 @@ const userSchema = new mongoose.Schema({
   avatarUrl: {
     type: String,
     trim: true
+  },
+  lastHealthSyncAt: {
+    type: Date,
   },
   totalKmLifetime: {
     type: Number,
