@@ -88,6 +88,7 @@ mongoose.connect(MONGODB_URI)
       console.log(`   POST   /api/races`);
       console.log(`   POST   /api/races/:id/join`);
       console.log(`   PUT    /api/races/:id/distance`);
+      console.log(`   POST   /api/races/health/sync`);
       console.log(`   GET    /api/races/:id/leaderboard`);
       console.log(`   PUT    /api/races/:id`);
       console.log(`   DELETE /api/races/:id`);

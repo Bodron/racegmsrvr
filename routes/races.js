@@ -547,6 +547,177 @@ router.put('/:id/distance', authMiddleware, [
   }
 });
 
+function asIsoDayString(dateLike) {
+  const d = new Date(dateLike);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString().split('T')[0];
+}
+
+function getParticipant(race, userId) {
+  return race.participants.find(
+    (p) => p.user.toString() === userId.toString(),
+  );
+}
+
+// HealthKit sync (protected)
+// Accepts per-day totals and applies them to the user's most-recent active race participation.
+router.post('/health/sync', authMiddleware, [
+  body('days').isArray({ min: 1, max: 60 }),
+  body('days.*.date').isISO8601(),
+  body('days.*.distanceKm').isFloat({ min: 0 }),
+], async (req, res) => {
+  const startTime = Date.now();
+
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const now = new Date();
+    const days = Array.isArray(req.body.days) ? req.body.days : [];
+
+    // Find active races where user is participant (by date range, not stored status).
+    const activeRaces = await Race.find({
+      'participants.user': req.userId,
+      startDate: { $lte: now },
+      endDate: { $gte: now },
+    });
+
+    if (!activeRaces.length) {
+      return res.json({
+        message: 'No active race participation found',
+        applied: false,
+        deltaKm: 0,
+      });
+    }
+
+    // Pick race with latest joinedAt.
+    let selectedRace = null;
+    let latestJoinedAt = null;
+    for (const r of activeRaces) {
+      const p = getParticipant(r, req.userId);
+      if (!p) continue;
+      const joinedAt = p.joinedAt ? new Date(p.joinedAt) : null;
+      if (!joinedAt || Number.isNaN(joinedAt.getTime())) continue;
+      if (!latestJoinedAt || joinedAt > latestJoinedAt) {
+        latestJoinedAt = joinedAt;
+        selectedRace = r;
+      }
+    }
+
+    if (!selectedRace) {
+      return res.json({
+        message: 'No active race participation found',
+        applied: false,
+        deltaKm: 0,
+      });
+    }
+
+    const race = selectedRace;
+    const participant = getParticipant(race, req.userId);
+    if (!participant) {
+      return res.json({
+        message: 'No active race participation found',
+        applied: false,
+        deltaKm: 0,
+      });
+    }
+
+    // Map existing daily entries by ISO day.
+    const existingByDay = new Map();
+    for (const entry of participant.dailyDistances || []) {
+      const key = asIsoDayString(entry.date);
+      if (!key) continue;
+      existingByDay.set(key, entry);
+    }
+
+    let deltaKm = 0;
+    for (const item of days) {
+      const dayKey = asIsoDayString(item.date);
+      if (!dayKey) continue;
+
+      const incoming = Number(item.distanceKm || 0);
+      if (!Number.isFinite(incoming) || incoming < 0) continue;
+
+      const existing = existingByDay.get(dayKey);
+      const oldDistance = Number(existing?.distance || 0);
+      const newDistance = Math.max(oldDistance, incoming); // never move backwards
+
+      if (!existing) {
+        participant.dailyDistances.push({
+          date: new Date(dayKey),
+          distance: newDistance,
+        });
+      } else {
+        existing.distance = newDistance;
+      }
+
+      const gained = Math.max(0, newDistance - oldDistance);
+      if (gained > 0) {
+        deltaKm += gained;
+      }
+    }
+
+    // Recompute participant totalDistance from entries (safe).
+    participant.totalDistance = Number(
+      (participant.dailyDistances || []).reduce((sum, d) => sum + Number(d.distance || 0), 0),
+    );
+
+    // Completion check.
+    const raceDistance = race.calculateRaceDistance();
+    if (participant.totalDistance >= raceDistance && participant.status === 'active') {
+      participant.status = 'completed';
+      participant.completedAt = new Date();
+    }
+
+    await race.save();
+
+    let progression = null;
+    let lastHealthSyncAt = null;
+    if (deltaKm > 0) {
+      const user = await User.findById(req.userId);
+      if (user) {
+        user.totalKmLifetime = Number(
+          ((Number(user.totalKmLifetime || 0)) + deltaKm).toFixed(2),
+        );
+        const xpGain = Math.floor(deltaKm * XP_PER_KM);
+        user.totalXp = Number(user.totalXp || 0) + xpGain;
+        user.level = levelFromXp(user.totalXp);
+        user.lastHealthSyncAt = now;
+        lastHealthSyncAt = user.lastHealthSyncAt;
+        await user.save();
+        progression = progressionFromXp(user.totalXp);
+      }
+    } else {
+      // Still store sync time to avoid repeating expensive reads.
+      const user = await User.findById(req.userId).select('lastHealthSyncAt');
+      if (user) {
+        user.lastHealthSyncAt = now;
+        lastHealthSyncAt = user.lastHealthSyncAt;
+        await user.save();
+      }
+    }
+
+    const duration = Date.now() - startTime;
+    console.log(
+      `✅ [RACES] Health sync applied to race ${race._id} for user ${req.userId} (+${deltaKm.toFixed(2)} km) in ${duration}ms`,
+    );
+
+    res.json({
+      message: 'Health sync applied',
+      applied: true,
+      raceId: race._id,
+      deltaKm: Number(deltaKm.toFixed(3)),
+      lastHealthSyncAt,
+      progression,
+    });
+  } catch (error) {
+    console.error('❌ [RACES] Error syncing Health data:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
 // Get race leaderboard
 router.get('/:id/leaderboard', async (req, res) => {
   try {
