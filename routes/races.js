@@ -38,6 +38,25 @@ function progressionFromXp(totalXp) {
   };
 }
 
+async function findOngoingParticipation(userId, excludeRaceId = null) {
+  const now = new Date();
+  const query = {
+    endDate: { $gte: now },
+    participants: {
+      $elemMatch: {
+        user: userId,
+        status: { $ne: 'withdrawn' },
+      },
+    },
+  };
+
+  if (excludeRaceId) {
+    query._id = { $ne: excludeRaceId };
+  }
+
+  return Race.findOne(query).select('_id name startDate endDate');
+}
+
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
 function requireGoogleKey() {
@@ -459,6 +478,19 @@ router.post('/:id/join', authMiddleware, async (req, res) => {
       return res.status(400).json({ message: 'Race has ended' });
     }
 
+    const conflictingRace = await findOngoingParticipation(req.userId, race._id);
+    if (conflictingRace) {
+      return res.status(400).json({
+        message: `You can participate in only one race at a time. Leave or finish "${conflictingRace.name}" first.`,
+        conflictingRace: {
+          id: conflictingRace._id,
+          name: conflictingRace.name,
+          startDate: conflictingRace.startDate,
+          endDate: conflictingRace.endDate,
+        },
+      });
+    }
+
     await race.addParticipant(req.userId);
     
     console.log(`✅ [RACES] User joined race successfully`);
@@ -479,72 +511,11 @@ router.post('/:id/join', authMiddleware, async (req, res) => {
   }
 });
 
-// Update daily distance (protected)
-router.put('/:id/distance', authMiddleware, [
-  body('date').isISO8601(),
-  body('distance').isFloat({ min: 0 }),
-], async (req, res) => {
-  try {
-    console.log(`\n📊 [RACES] Updating distance for race ${req.params.id}`);
-    console.log(`User: ${req.userId}`);
-    console.log(`Date: ${req.body.date}`);
-    console.log(`Distance: ${req.body.distance} km`);
-    
-    const { date, distance } = req.body;
-    
-    const race = await Race.findById(req.params.id);
-    
-    if (!race) {
-      return res.status(404).json({ message: 'Race not found' });
-    }
-
-    const participant = race.participants.find(
-      (p) => p.user.toString() === req.userId.toString(),
-    );
-    if (!participant) {
-      return res.status(400).json({ message: 'User is not a participant' });
-    }
-
-    const dateStr = new Date(date).toISOString().split('T')[0];
-    const existingEntry = participant.dailyDistances.find(
-      (d) => new Date(d.date).toISOString().split('T')[0] === dateStr,
-    );
-    const oldDistance = Number(existingEntry?.distance || 0);
-
-    await race.updateDailyDistance(req.userId, date, distance);
-
-    const newDistance = Number(distance);
-    const deltaKm = Math.max(0, newDistance - oldDistance);
-    let progression = null;
-
-    if (deltaKm > 0) {
-      const user = await User.findById(req.userId);
-      if (user) {
-        user.totalKmLifetime = Number(
-          ((Number(user.totalKmLifetime || 0)) + deltaKm).toFixed(2),
-        );
-        const xpGain = Math.floor(deltaKm * XP_PER_KM);
-        user.totalXp = Number(user.totalXp || 0) + xpGain;
-        user.level = levelFromXp(user.totalXp);
-        await user.save();
-        progression = progressionFromXp(user.totalXp);
-      }
-    }
-    
-    console.log(`✅ [RACES] Distance updated successfully`);
-    
-    const updatedRace = await Race.findById(req.params.id)
-      .populate('participants.user', 'email name nickname avatarUrl');
-
-    res.json({
-      message: 'Distance updated successfully',
-      race: updatedRace,
-      progression,
-    });
-  } catch (error) {
-    console.error('❌ [RACES] Error updating distance:', error);
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
+// Distance updates are allowed only via Health sync.
+router.put('/:id/distance', authMiddleware, async (req, res) => {
+  return res.status(403).json({
+    message: 'Manual distance updates are disabled. Use /api/races/health/sync.',
+  });
 });
 
 function asIsoDayString(dateLike) {

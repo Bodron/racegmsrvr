@@ -39,6 +39,25 @@ function toPublicUser(user) {
   };
 }
 
+async function findOngoingParticipation(userId, excludeRaceId = null) {
+  const now = new Date();
+  const query = {
+    endDate: { $gte: now },
+    participants: {
+      $elemMatch: {
+        user: userId,
+        status: { $ne: 'withdrawn' },
+      },
+    },
+  };
+
+  if (excludeRaceId) {
+    query._id = { $ne: excludeRaceId };
+  }
+
+  return Race.findOne(query).select('_id name startDate endDate');
+}
+
 // Search users by nickname prefix
 router.get('/users/search', authMiddleware, [
   query('nickname').trim().isLength({ min: 2, max: 24 }),
@@ -239,6 +258,13 @@ router.post('/races/:raceId/invites', authMiddleware, [
       return res.status(400).json({ message: 'User is already a participant' });
     }
 
+    const conflictingRace = await findOngoingParticipation(friendId, race._id);
+    if (conflictingRace) {
+      return res.status(400).json({
+        message: `User can participate in only one race at a time (currently in "${conflictingRace.name}").`,
+      });
+    }
+
     if (new Date() > race.endDate) {
       return res.status(400).json({ message: 'Race has ended' });
     }
@@ -341,6 +367,15 @@ router.post('/race-invites/:id/respond', authMiddleware, [
       (p) => p.user.toString() === req.userId.toString(),
     );
     if (!alreadyParticipant) {
+      const conflictingRace = await findOngoingParticipation(req.userId, race._id);
+      if (conflictingRace) {
+        invite.status = 'expired';
+        invite.respondedAt = new Date();
+        await invite.save();
+        return res.status(400).json({
+          message: `You can participate in only one race at a time. Finish "${conflictingRace.name}" first.`,
+        });
+      }
       await race.addParticipant(req.userId);
     }
 
