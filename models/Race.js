@@ -36,6 +36,31 @@ const participantSchema = new mongoose.Schema({
   }
 });
 
+const finishResolutionSchema = new mongoose.Schema({
+  provisionalWinner: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null,
+  },
+  provisionalAt: {
+    type: Date,
+    default: null,
+  },
+  confirmationWindowEndsAt: {
+    type: Date,
+    default: null,
+  },
+  finalWinner: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null,
+  },
+  finalizedAt: {
+    type: Date,
+    default: null,
+  },
+}, { _id: false });
+
 const raceSchema = new mongoose.Schema({
   name: {
     type: String,
@@ -96,6 +121,10 @@ const raceSchema = new mongoose.Schema({
     }
   },
   participants: [participantSchema],
+  finishResolution: {
+    type: finishResolutionSchema,
+    default: () => ({}),
+  },
   status: {
     type: String,
     enum: ['upcoming', 'active', 'completed'],

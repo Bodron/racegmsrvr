@@ -7,6 +7,9 @@ const uploadToS3 = require('../utils/awsUpload');
 
 const router = express.Router();
 const XP_PER_KM = 10;
+const FINISH_CONFIRMATION_WINDOW_MS = Number(
+  process.env.FINISH_CONFIRMATION_WINDOW_MS || 90_000,
+);
 
 function xpForLevel(level) {
   if (level <= 1) return 0;
@@ -55,6 +58,227 @@ async function findOngoingParticipation(userId, excludeRaceId = null) {
   }
 
   return Race.findOne(query).select('_id name startDate endDate');
+}
+
+function toRaceLeaderboardEntry(participant, raceDistance) {
+  const userDoc =
+    participant.user && typeof participant.user === 'object'
+      ? participant.user
+      : null;
+  const rawUserId = userDoc?._id || participant.user;
+  const userId = rawUserId ? rawUserId.toString() : '';
+  const totalDistance = Number(participant.totalDistance || 0);
+  const safeRaceDistance = Number(raceDistance || 0);
+  const progress =
+    safeRaceDistance > 0
+      ? Math.min(Math.max(totalDistance / safeRaceDistance, 0), 1)
+      : 0;
+
+  return {
+    userId,
+    user: participant.user,
+    name: (userDoc && (userDoc.name || userDoc.nickname || userDoc.email)) || 'Participant',
+    totalDistance,
+    progress: Number(progress.toFixed(4)),
+    distanceRemaining: Number(Math.max(0, safeRaceDistance - totalDistance).toFixed(3)),
+    status: participant.status,
+    completedAt: participant.completedAt || null,
+    joinedAt: participant.joinedAt || null,
+    dailyDistances: participant.dailyDistances || [],
+  };
+}
+
+function compareRaceLeaderboardEntries(a, b) {
+  if (b.totalDistance !== a.totalDistance) {
+    return b.totalDistance - a.totalDistance;
+  }
+
+  const aCompleted = a.status === 'completed';
+  const bCompleted = b.status === 'completed';
+  if (aCompleted !== bCompleted) {
+    return aCompleted ? -1 : 1;
+  }
+
+  const aCompletedAt = a.completedAt ? new Date(a.completedAt).getTime() : Number.POSITIVE_INFINITY;
+  const bCompletedAt = b.completedAt ? new Date(b.completedAt).getTime() : Number.POSITIVE_INFINITY;
+  if (aCompletedAt !== bCompletedAt) {
+    return aCompletedAt - bCompletedAt;
+  }
+
+  const aJoinedAt = a.joinedAt ? new Date(a.joinedAt).getTime() : Number.POSITIVE_INFINITY;
+  const bJoinedAt = b.joinedAt ? new Date(b.joinedAt).getTime() : Number.POSITIVE_INFINITY;
+  if (aJoinedAt !== bJoinedAt) {
+    return aJoinedAt - bJoinedAt;
+  }
+
+  return (a.name || '').localeCompare(b.name || '');
+}
+
+function buildRaceLeaderboard(race) {
+  const raceDistance = race.calculateRaceDistance();
+  const entries = (race.participants || [])
+    .map((participant) => toRaceLeaderboardEntry(participant, raceDistance))
+    .sort(compareRaceLeaderboardEntries)
+    .map((entry, index) => ({
+      ...entry,
+      position: index + 1,
+    }));
+
+  return {
+    raceDistance,
+    leaderboard: entries,
+  };
+}
+
+function asUserId(value) {
+  if (!value) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'object' && value._id) return value._id.toString();
+  if (typeof value.toString === 'function') return value.toString();
+  return '';
+}
+
+function pickEarliestCompletedParticipant(race) {
+  let earliest = null;
+  for (const participant of race.participants || []) {
+    if (participant.status !== 'completed' || !participant.completedAt) continue;
+    if (!earliest) {
+      earliest = participant;
+      continue;
+    }
+
+    const currentMs = new Date(participant.completedAt).getTime();
+    const earliestMs = new Date(earliest.completedAt).getTime();
+    if (currentMs < earliestMs) {
+      earliest = participant;
+      continue;
+    }
+
+    if (currentMs === earliestMs) {
+      const currentUserId = asUserId(participant.user);
+      const earliestUserId = asUserId(earliest.user);
+      if (currentUserId && earliestUserId && currentUserId < earliestUserId) {
+        earliest = participant;
+      }
+    }
+  }
+  return earliest;
+}
+
+function buildFinishStatePayload(race) {
+  const resolution = race.finishResolution || {};
+  const finalWinnerUserId = asUserId(resolution.finalWinner);
+  const provisionalWinnerUserId = asUserId(resolution.provisionalWinner);
+  const status = finalWinnerUserId
+    ? 'final'
+    : provisionalWinnerUserId
+      ? 'provisional'
+      : 'none';
+
+  return {
+    status,
+    winnerUserId: finalWinnerUserId || provisionalWinnerUserId || null,
+    provisionalWinnerUserId: provisionalWinnerUserId || null,
+    provisionalAt: resolution.provisionalAt || null,
+    confirmationWindowEndsAt: resolution.confirmationWindowEndsAt || null,
+    finalWinnerUserId: finalWinnerUserId || null,
+    finalizedAt: resolution.finalizedAt || null,
+    confirmationWindowMs: FINISH_CONFIRMATION_WINDOW_MS,
+  };
+}
+
+function refreshFinishResolution(race, now = new Date()) {
+  const resolution = race.finishResolution || {};
+  const earliest = pickEarliestCompletedParticipant(race);
+  const nowMs = now.getTime();
+  let changed = false;
+
+  if (!earliest) {
+    if (
+      resolution.provisionalWinner ||
+      resolution.provisionalAt ||
+      resolution.confirmationWindowEndsAt ||
+      resolution.finalWinner ||
+      resolution.finalizedAt
+    ) {
+      resolution.provisionalWinner = null;
+      resolution.provisionalAt = null;
+      resolution.confirmationWindowEndsAt = null;
+      resolution.finalWinner = null;
+      resolution.finalizedAt = null;
+      changed = true;
+    }
+    race.finishResolution = resolution;
+    return { changed, finishState: buildFinishStatePayload(race) };
+  }
+
+  const winnerUserId = asUserId(earliest.user);
+  const winnerAt = new Date(earliest.completedAt);
+  const provisionalWinnerUserId = asUserId(resolution.provisionalWinner);
+  const finalWinnerUserId = asUserId(resolution.finalWinner);
+
+  // If historical data changed and final winner is no longer earliest,
+  // reopen arbitration and resolve again.
+  if (finalWinnerUserId && finalWinnerUserId !== winnerUserId) {
+    resolution.finalWinner = null;
+    resolution.finalizedAt = null;
+    changed = true;
+  }
+
+  if (provisionalWinnerUserId !== winnerUserId) {
+    resolution.provisionalWinner = earliest.user;
+    resolution.provisionalAt = winnerAt;
+    resolution.confirmationWindowEndsAt = new Date(
+      nowMs + FINISH_CONFIRMATION_WINDOW_MS,
+    );
+    resolution.finalWinner = null;
+    resolution.finalizedAt = null;
+    changed = true;
+  } else {
+    const provisionalAtMs = resolution.provisionalAt
+      ? new Date(resolution.provisionalAt).getTime()
+      : 0;
+    if (provisionalAtMs !== winnerAt.getTime()) {
+      resolution.provisionalAt = winnerAt;
+      changed = true;
+    }
+    if (!resolution.confirmationWindowEndsAt) {
+      resolution.confirmationWindowEndsAt = new Date(
+        nowMs + FINISH_CONFIRMATION_WINDOW_MS,
+      );
+      changed = true;
+    }
+  }
+
+  if (
+    !resolution.finalWinner &&
+    resolution.confirmationWindowEndsAt &&
+    nowMs >= new Date(resolution.confirmationWindowEndsAt).getTime()
+  ) {
+    resolution.finalWinner = earliest.user;
+    resolution.finalizedAt = now;
+    changed = true;
+  }
+
+  race.finishResolution = resolution;
+  return { changed, finishState: buildFinishStatePayload(race) };
+}
+
+async function syncFinishResolution(race, now = new Date()) {
+  const result = refreshFinishResolution(race, now);
+  if (result.changed) {
+    await race.save();
+  }
+  return result.finishState;
+}
+
+async function syncFinishResolutionForRaces(races, now = new Date()) {
+  for (const race of races) {
+    const result = refreshFinishResolution(race, now);
+    if (result.changed) {
+      await race.save();
+    }
+  }
 }
 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
@@ -159,11 +383,14 @@ router.get('/', async (req, res) => {
       .populate('participants.user', 'email name nickname avatarUrl')
       .populate('createdBy', 'email name avatarUrl')
       .sort({ startDate: -1 });
+
+    await syncFinishResolutionForRaces(races, new Date());
     
     // Add distance to each race
     const racesWithDistance = races.map(race => {
       const raceObj = race.toObject();
       raceObj.distance = race.calculateRaceDistance();
+      raceObj.finishState = buildFinishStatePayload(race);
       return raceObj;
     });
     
@@ -185,21 +412,13 @@ router.get('/leaderboard', authMiddleware, async (req, res) => {
     const races = await Race.find({})
       .populate('participants.user', 'email name nickname avatarUrl');
 
+    await syncFinishResolutionForRaces(races, new Date());
+
     const map = new Map(); // userId -> { userId, name, email, totalKm, races, wins }
 
     for (const race of races) {
-      // Determine winner for this race (earliest completion)
-      let winnerUserId = null;
-      let winnerCompletedAt = null;
-
-      for (const p of race.participants) {
-        if (p.status !== 'completed' || !p.completedAt) continue;
-        if (!winnerCompletedAt || p.completedAt < winnerCompletedAt) {
-          winnerCompletedAt = p.completedAt;
-          const uid = (p.user && p.user._id) ? p.user._id : p.user;
-          winnerUserId = uid ? uid.toString() : null;
-        }
-      }
+      // Count wins only when winner is finalized.
+      const winnerUserId = asUserId(race.finishResolution?.finalWinner) || null;
 
       for (const p of race.participants) {
         const uid = (p.user && p.user._id) ? p.user._id : p.user;
@@ -263,6 +482,8 @@ router.get('/my-stats', authMiddleware, async (req, res) => {
       'participants.user': req.userId,
     }).populate('participants.user', 'email name nickname avatarUrl');
 
+    await syncFinishResolutionForRaces(races, new Date());
+
     let racesParticipated = 0;
     let wins = 0;
     let totalKm = 0;
@@ -285,17 +506,8 @@ router.get('/my-stats', authMiddleware, async (req, res) => {
         name = myParticipant.user.email;
       }
 
-      // Winner is the earliest completed participant in this race.
-      let winnerUserId = null;
-      let winnerCompletedAt = null;
-      for (const p of race.participants) {
-        if (p.status !== 'completed' || !p.completedAt) continue;
-        if (!winnerCompletedAt || p.completedAt < winnerCompletedAt) {
-          winnerCompletedAt = p.completedAt;
-          const uid = (p.user && p.user._id) ? p.user._id : p.user;
-          winnerUserId = uid ? uid.toString() : null;
-        }
-      }
+      // Count wins only when winner is finalized.
+      const winnerUserId = asUserId(race.finishResolution?.finalWinner) || null;
 
       if (winnerUserId && winnerUserId === req.userId) {
         wins += 1;
@@ -337,8 +549,11 @@ router.get('/:id', async (req, res) => {
     
     console.log(`✅ [RACES] Race found: ${race.name}`);
     
+    await syncFinishResolution(race, new Date());
+
     const raceObj = race.toObject();
     raceObj.distance = race.calculateRaceDistance();
+    raceObj.finishState = buildFinishStatePayload(race);
     
     res.json({ race: raceObj });
   } catch (error) {
@@ -642,6 +857,7 @@ router.post('/health/sync', authMiddleware, [
       participant.completedAt = new Date();
     }
 
+    const finishState = refreshFinishResolution(race, now).finishState;
     await race.save();
 
     let progression = null;
@@ -682,6 +898,7 @@ router.post('/health/sync', authMiddleware, [
       deltaKm: Number(deltaKm.toFixed(3)),
       lastHealthSyncAt,
       progression,
+      finishState,
     });
   } catch (error) {
     console.error('❌ [RACES] Error syncing Health data:', error);
@@ -701,16 +918,8 @@ router.get('/:id/leaderboard', async (req, res) => {
       return res.status(404).json({ message: 'Race not found' });
     }
 
-    // Sort participants by total distance (descending)
-    const leaderboard = race.participants
-      .map(p => ({
-        user: p.user,
-        totalDistance: p.totalDistance,
-        status: p.status,
-        completedAt: p.completedAt,
-        dailyDistances: p.dailyDistances
-      }))
-      .sort((a, b) => b.totalDistance - a.totalDistance);
+    await syncFinishResolution(race, new Date());
+    const { raceDistance, leaderboard } = buildRaceLeaderboard(race);
     
     console.log(`✅ [RACES] Leaderboard generated with ${leaderboard.length} participants`);
     
@@ -718,7 +927,10 @@ router.get('/:id/leaderboard', async (req, res) => {
       race: {
         id: race._id,
         name: race.name,
-        distance: race.calculateRaceDistance()
+        distance: raceDistance,
+        status: race.status,
+        participantsCount: race.participants.length,
+        finishState: buildFinishStatePayload(race),
       },
       leaderboard
     });
